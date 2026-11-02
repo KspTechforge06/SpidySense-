@@ -1,6 +1,7 @@
 package com.sixthsense.prototype.viewmodel
 
 import android.app.Application
+import android.util.Log
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.sixthsense.prototype.bluetooth.BleController
@@ -9,6 +10,8 @@ import com.sixthsense.prototype.camera.CameraController
 import com.sixthsense.prototype.camera.CameraState
 import com.sixthsense.prototype.navigation.HapticCommand
 import com.sixthsense.prototype.navigation.HapticCommandMapper
+import com.sixthsense.prototype.navigation.HapticPolicy
+import com.sixthsense.prototype.navigation.HapticPolicyConfig
 import com.sixthsense.prototype.settings.AppSettings
 import com.sixthsense.prototype.settings.SettingsRepository
 import com.sixthsense.prototype.vision.DetectionResult
@@ -31,17 +34,21 @@ data class NavigationUiState(
     val latestCommand: HapticCommand? = null,
     val detections: List<DetectionResult> = emptyList(),
     val visionMessage: String = "Detector stopped",
+    /** Per-zone consecutive-frame counts from the policy, for UI zone indicators. */
+    val zoneCounts: Map<DirectionZone, Int> = emptyMap(),
+    /** Total haptic commands sent this navigation session. */
+    val commandsSentCount: Int = 0,
 )
 
 class SixthSenseViewModel(application: Application) : AndroidViewModel(application) {
     private val bleController = BleController(application)
     private val settingsRepository = SettingsRepository(application)
     private val cameraController = CameraController()
+    private val hapticPolicy = HapticPolicy()
     private val objectAnalyzer = MlKitObjectAnalyzer(
         onDetections = ::handleDetections,
         onError = { error -> handleVisionError(error) },
     )
-    private var lastHapticAtMs = Long.MIN_VALUE
     val ble: StateFlow<BleUiState> = bleController.state
     val camera: StateFlow<CameraState> = cameraController.state
     val settings: StateFlow<AppSettings> = settingsRepository.settings.stateIn(
@@ -57,9 +64,22 @@ class SixthSenseViewModel(application: Application) : AndroidViewModel(applicati
                 if (_navigation.value.running) stopNavigation()
             }
         }
+        // Keep the haptic policy config in sync with user settings.
+        viewModelScope.launch {
+            settings.collect { appSettings ->
+                hapticPolicy.updateConfig(
+                    HapticPolicyConfig(
+                        confidenceThreshold = appSettings.confidenceThreshold,
+                        perZoneCooldownMs = appSettings.cooldownMillis.toLong(),
+                    )
+                )
+            }
+        }
     }
 
     fun connectWearable() = bleController.connect()
+    fun scanForBleDevices() = bleController.scanForDevices()
+    fun connectToBleDevice(address: String) = bleController.connectToDevice(address)
     fun disconnectWearable() = bleController.disconnect()
     fun bluetoothPermissions(): Array<String> = bleController.requiredPermissions()
     fun hasBluetoothPermissions(): Boolean = bleController.hasRequiredPermissions()
@@ -67,17 +87,20 @@ class SixthSenseViewModel(application: Application) : AndroidViewModel(applicati
     fun startCamera(context: android.content.Context, owner: androidx.lifecycle.LifecycleOwner, view: androidx.camera.view.PreviewView) =
         cameraController.start(context, owner, view, objectAnalyzer)
     fun startNavigation() {
-        _navigation.value = _navigation.value.copy(running = true, visionMessage = "ML Kit detector starting…")
+        hapticPolicy.reset()
+        _navigation.value = _navigation.value.copy(running = true, visionMessage = "ML Kit detector starting…", commandsSentCount = 0)
     }
     fun stopNavigation() = stopNavigationInternal("Detector stopped")
 
     private fun stopNavigationInternal(visionMessage: String) {
         cameraController.stop()
+        hapticPolicy.reset()
         _navigation.value = _navigation.value.copy(
             running = false,
             latestCommand = HapticCommand.STOP,
             currentZone = DirectionZone.UNKNOWN,
             visionMessage = visionMessage,
+            zoneCounts = emptyMap(),
         )
         if (ble.value.commandReady) bleController.send(HapticCommand.STOP)
     }
@@ -101,30 +124,27 @@ class SixthSenseViewModel(application: Application) : AndroidViewModel(applicati
         viewModelScope.launch {
             if (!_navigation.value.running) return@launch
 
-            val configuration = settings.value
-            // ML Kit's default classifier is coarse. Until a custom detector is
-            // selected, trigger only from a classification above the user's
-            // threshold; unclassified boxes remain visible for debugging.
-            val candidate = detections
-                .filter { it.confidence >= configuration.confidenceThreshold }
-                .maxByOrNull { it.confidence }
-            val zone = candidate?.let {
-                DirectionZoneMapper.fromNormalizedCenter(it.normalizedHorizontalCenter)
-            } ?: DirectionZone.UNKNOWN
+            val now = SystemClock.elapsedRealtime()
+            val result = hapticPolicy.evaluate(detections, now)
+
             _navigation.value = _navigation.value.copy(
                 detections = detections,
-                currentZone = zone,
-                visionMessage = if (detections.isEmpty()) "No ML Kit object detected" else "ML Kit processed ${detections.size} object(s)",
+                currentZone = result.activeZone,
+                zoneCounts = result.zoneCounts,
+                commandsSentCount = result.commandsSentCount,
+                visionMessage = if (detections.isEmpty()) {
+                    "No ML Kit object detected"
+                } else {
+                    "ML Kit processed ${detections.size} object(s)"
+                },
             )
 
-            val command = candidate?.let { HapticCommandMapper.forZone(zone) } ?: return@launch
-            val now = SystemClock.elapsedRealtime()
-            if (!ble.value.commandReady) return@launch
-            if (lastHapticAtMs != Long.MIN_VALUE && now - lastHapticAtMs < configuration.cooldownMillis) {
+            val command = result.command ?: return@launch
+            if (!ble.value.commandReady) {
+                Log.d(TAG, "Command $command ready but BLE not connected, skipping")
                 return@launch
             }
 
-            lastHapticAtMs = now
             _navigation.value = _navigation.value.copy(latestCommand = command)
             bleController.send(command)
         }
@@ -136,5 +156,9 @@ class SixthSenseViewModel(application: Application) : AndroidViewModel(applicati
                 stopNavigationInternal("ML Kit error: ${error.message ?: "unknown error"}")
             }
         }
+    }
+
+    companion object {
+        private const val TAG = "SixthSenseViewModel"
     }
 }

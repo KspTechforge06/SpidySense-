@@ -14,9 +14,11 @@ import android.bluetooth.le.ScanResult
 import android.bluetooth.le.ScanSettings
 import android.content.Context
 import android.content.pm.PackageManager
+import android.location.LocationManager
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
+import android.util.Log
 import androidx.core.content.ContextCompat
 import com.sixthsense.prototype.navigation.HapticCommand
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -38,11 +40,19 @@ class BleController(context: Context) {
     private var commandCharacteristic: BluetoothGattCharacteristic? = null
     private var writeInFlight = false
     private var intentionalDisconnect = false
+    private val scannedDevices = mutableMapOf<String, BluetoothDevice>()
 
     private val scanTimeout = Runnable {
         if (_state.value.connectionState == BleConnectionState.SCANNING) {
-            stopScan()
-            error("SixthSense-ESP32 was not found before scan timeout.")
+            stopScan(preserveMessage = true)
+            _state.value = _state.value.copy(
+                connectionState = BleConnectionState.DISCONNECTED,
+                message = if (_state.value.discoveredDevices.isEmpty()) {
+                    "No BLE devices were found. Check Nearby devices permission and Bluetooth."
+                } else {
+                    "Scan finished. Select a device from the list to connect."
+                },
+            )
         }
     }
 
@@ -54,39 +64,100 @@ class BleController(context: Context) {
         Build.VERSION.SDK_INT >= Build.VERSION_CODES.S -> arrayOf(
             Manifest.permission.BLUETOOTH_SCAN, Manifest.permission.BLUETOOTH_CONNECT
         )
-        else -> arrayOf(Manifest.permission.ACCESS_FINE_LOCATION)
+        else -> arrayOf(
+            Manifest.permission.ACCESS_FINE_LOCATION,
+            Manifest.permission.ACCESS_COARSE_LOCATION,
+        )
     }
 
+    /**
+     * On Android 11 and earlier, BLE scanning requires Location Services
+     * (GPS / network location) to be turned on in system settings, even when
+     * the app already holds ACCESS_FINE_LOCATION permission.
+     * Android 12+ with `neverForLocation` does NOT require this.
+     */
+    private fun isLocationEnabledIfRequired(): Boolean {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) return true
+        return try {
+            val locationManager = appContext.getSystemService(Context.LOCATION_SERVICE) as? LocationManager
+            locationManager?.isProviderEnabled(LocationManager.GPS_PROVIDER) == true ||
+                locationManager?.isProviderEnabled(LocationManager.NETWORK_PROVIDER) == true
+        } catch (_: Exception) { true }
+    }
+
+    /** Public accessor for the UI to show a helpful message before the user taps Scan. */
+    fun needsLocationServicesEnabled(): Boolean =
+        Build.VERSION.SDK_INT < Build.VERSION_CODES.S && !isLocationEnabledIfRequired()
+
     @SuppressLint("MissingPermission")
-    fun connect() {
+    fun scanForDevices() {
         if (!hasRequiredPermissions()) { error("Bluetooth permission is required to scan and connect."); return }
         if (adapter?.isEnabled != true) { error("Bluetooth is unavailable or turned off."); return }
+        if (!isLocationEnabledIfRequired()) {
+            error("Location services must be turned on for BLE scanning (Android 11 and below). Enable GPS or network location in system Settings.")
+            return
+        }
+        val scanner = adapter?.bluetoothLeScanner
+        if (scanner == null) {
+            error("BLE scanner is not available. Check that Bluetooth is on and try again.")
+            return
+        }
         closeConnection()
-        _state.value = BleUiState(BleConnectionState.SCANNING, "Scanning for ${BleProtocol.DEVICE_NAME}…")
+        scannedDevices.clear()
+        _state.value = BleUiState(BleConnectionState.SCANNING, "Scanning for nearby BLE devices…")
         val callback = object : ScanCallback() {
             override fun onScanResult(callbackType: Int, result: ScanResult) {
-                if (!isSixthSenseWearable(result)) return
-                stopScan()
-                _state.value = BleUiState(
-                    BleConnectionState.CONNECTING,
-                    "Found ${BleProtocol.DEVICE_NAME}; connecting…",
-                )
-                connectGatt(result.device)
+                Log.d(TAG, "onScanResult: ${result.device.address} name=${result.scanRecord?.deviceName} rssi=${result.rssi}")
+                addDiscoveredDevice(result)
             }
-            override fun onScanFailed(errorCode: Int) = error("BLE scan failed (code $errorCode).")
+            override fun onBatchScanResults(results: MutableList<ScanResult>) {
+                Log.d(TAG, "onBatchScanResults: ${results.size} results")
+                results.forEach { addDiscoveredDevice(it) }
+            }
+            override fun onScanFailed(errorCode: Int) {
+                Log.e(TAG, "BLE scan failed with error code $errorCode")
+                when (errorCode) {
+                    SCAN_FAILED_ALREADY_STARTED -> {
+                        // Stop existing scan and retry once.
+                        scannerCallback?.let { scanner.stopScan(it) }
+                        scannerCallback = null
+                        handler.postDelayed({ scanForDevices() }, 500)
+                        return
+                    }
+                    SCAN_FAILED_APPLICATION_REGISTRATION_FAILED ->
+                        error("BLE scan failed: app registration failed. Toggle Bluetooth off/on and try again.")
+                    SCAN_FAILED_FEATURE_UNSUPPORTED ->
+                        error("BLE scan failed: feature unsupported on this device.")
+                    else -> error("BLE scan failed (code $errorCode). Try toggling Bluetooth off and on.")
+                }
+            }
         }
         scannerCallback = callback
         // Do not use Android's hardware service-UUID filter here. Some ESP32
         // stacks put a 128-bit UUID or the local name in scan-response data,
         // which can be ignored by that filter even though a normal BLE scanner
-        // sees the peripheral. Match in the callback instead.
+        // sees the peripheral. Show the complete result list instead.
         val settings = ScanSettings.Builder()
             .setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY)
+            .setReportDelay(0)  // Deliver results immediately, not batched
             .build()
         // The settings-only overload does not exist. A null filter list means
-        // "report every BLE advertiser", then isSixthSenseWearable filters it.
-        adapter?.bluetoothLeScanner?.startScan(null, settings, callback)
+        // "report every BLE advertiser".
+        scanner.startScan(null, settings, callback)
         handler.postDelayed(scanTimeout, SCAN_TIMEOUT_MS)
+    }
+
+    /** Kept for callers that previously used the automatic connect action. */
+    fun connect() = scanForDevices()
+
+    @SuppressLint("MissingPermission")
+    fun connectToDevice(address: String) {
+        if (!hasRequiredPermissions()) { error("Bluetooth permission is required to connect."); return }
+        val device = scannedDevices[address]
+            ?: runCatching { adapter?.getRemoteDevice(address) }.getOrNull()
+        if (device == null) { error("That device is no longer available. Scan again."); return }
+        stopScan(preserveMessage = true)
+        connectGatt(device)
     }
 
     @SuppressLint("MissingPermission")
@@ -165,14 +236,19 @@ class BleController(context: Context) {
         }
     }
 
-    private fun isSixthSenseWearable(result: ScanResult): Boolean {
-        val record = result.scanRecord
-        val advertisedName = record?.deviceName
-        val serviceUuid = UUID.fromString(BleProtocol.SERVICE_UUID)
-        val hasExpectedService = record?.serviceUuids?.any { it.uuid == serviceUuid } == true
-        return result.device.name == BleProtocol.DEVICE_NAME ||
-            advertisedName == BleProtocol.DEVICE_NAME ||
-            hasExpectedService
+    @SuppressLint("MissingPermission")
+    private fun addDiscoveredDevice(result: ScanResult) {
+        val device = result.device
+        val name = result.scanRecord?.deviceName ?: device.name ?: "Unnamed BLE device"
+        scannedDevices[device.address] = device
+        val updated = _state.value.discoveredDevices
+            .filterNot { it.address == device.address }
+            .plus(BleDiscoveredDevice(device.address, name, result.rssi))
+            .sortedWith(compareByDescending<BleDiscoveredDevice> { it.name == BleProtocol.DEVICE_NAME }.thenByDescending { it.rssi })
+        _state.value = _state.value.copy(
+            message = "Scanning… ${updated.size} nearby device(s) found.",
+            discoveredDevices = updated,
+        )
     }
 
     @SuppressLint("MissingPermission")
@@ -221,11 +297,14 @@ class BleController(context: Context) {
     }
 
     @SuppressLint("MissingPermission")
-    fun stopScan() {
+    fun stopScan(preserveMessage: Boolean = false) {
         handler.removeCallbacks(scanTimeout)
-        scannerCallback?.let { adapter?.bluetoothLeScanner?.stopScan(it) }
+        scannerCallback?.let { cb ->
+            try { adapter?.bluetoothLeScanner?.stopScan(cb) }
+            catch (e: Exception) { Log.w(TAG, "stopScan error: ${e.message}") }
+        }
         scannerCallback = null
-        if (_state.value.connectionState == BleConnectionState.SCANNING) {
+        if (!preserveMessage && _state.value.connectionState == BleConnectionState.SCANNING) {
             _state.value = BleUiState(BleConnectionState.DISCONNECTED, "BLE scan stopped.")
         }
     }
@@ -234,6 +313,7 @@ class BleController(context: Context) {
     private fun error(message: String) { _state.value = BleUiState(BleConnectionState.ERROR, message) }
 
     companion object {
+        private const val TAG = "BleController"
         private const val SCAN_TIMEOUT_MS = 12_000L
         private const val STOP_BEFORE_CLOSE_MS = 150L
         private val CCCD_UUID: UUID = UUID.fromString("00002902-0000-1000-8000-00805f9b34fb")
