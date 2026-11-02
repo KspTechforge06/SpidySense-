@@ -1,5 +1,9 @@
 # SixthSense
 
+[![SixthSense Demo Video](https://img.youtube.com/vi/qxYp5X0WxyU/maxresdefault.jpg)](https://youtu.be/qxYp5X0WxyU)
+
+📺 **Watch the Demo:** [https://youtu.be/qxYp5X0WxyU](https://youtu.be/qxYp5X0WxyU)
+
 SixthSense is an experimental Android-to-wearable haptic prototype. A phone
 uses its rear camera and on-device ML Kit object detection, maps a detection to
 the left, front, or right part of the camera image, and sends a short BLE
