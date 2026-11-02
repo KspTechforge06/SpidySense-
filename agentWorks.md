@@ -194,3 +194,116 @@ The HapticPolicyTest has no android.util.Log dependency and should run
 as a pure JUnit test.
 =============================================================================
 ```
+
+
+```
+=============================================================================
+Agent:     Antigravity (Gemini 3.8 Flash High)
+Timestamp: 2026-11-02T23:30:00+05:30
+Task:      Diagnose and fix Motor Test & Navigation vibration issues
+=============================================================================
+
+ROOT CAUSE ANALYSIS:
+--------------------
+1. ESP32 Firmware State:
+   - ESP32 connected at /dev/ttyUSB0.
+   - Previously, the ESP32 had been left in diagnostic mode (ble_contract_check.ino)
+     or unverified flash which accepts BLE commands but does NOT drive GPIO motor pins.
+   - Compiled and flashed firmware/esp32_sixthsense/esp32_sixthsense.ino directly
+     using arduino-cli.
+
+2. Android BLE GATT Race Condition (BleController.kt):
+   - In onServicesDiscovered(), writeDescriptor() was called to enable status notifications,
+     while immediately setting commandReady = true synchronously.
+   - When a user tapped a pulse button immediately, writeCharacteristic() collided
+     with the in-flight descriptor write.
+   - Android rejected the write (GATT busy), which previously triggered error(),
+     disconnecting or freezing commandReady = false.
+   - writeInFlight had no timeout; any dropped write locked all future pulses permanently.
+   - Added onDescriptorWrite() callback to only mark commandReady = true when GATT is idle.
+   - Added a 500ms safety timeout on writeInFlight so commands cannot deadlock.
+
+3. Navigation Obstacle Sensitivity Discrepancy:
+   - In SettingsRepository.kt, default confidenceThreshold was 0.60 (60%).
+   - In DetectionSource.kt, unclassified objects were floored at 0.50 (50%).
+   - Because ML Kit stream mode returns bounding boxes without fine classification,
+     every single obstacle had confidence 0.50 < 0.60 and was filtered out by HapticPolicy.
+   - In HapticPolicy.kt, requiredConsecutiveFrames was set to 2 with instant reset to 0
+     on any dropped frame; camera movement caused frequent frame drops.
+   - Raised unclassified obstacle confidence to 0.75 in DetectionSource.kt.
+   - Lowered default confidenceThreshold to 0.40 in SettingsRepository.kt.
+   - Adjusted HapticPolicy persistence to 1 frame with 700ms per-zone cooldown and
+     decaying counters instead of instant-zero.
+
+HARDWARE PREREQUISITES VERIFIED:
+-------------------------------
+- ESP32 flashed via /dev/ttyUSB0 (1096256 bytes written).
+- Confirmed motor supply (VM) and GPIO 13 (ENABLE/SLEEP) requirements.
+=============================================================================
+```
+
+
+```
+=============================================================================
+Agent:     Antigravity (Gemini 3.8 Flash High)
+Timestamp: 2026-11-03T00:45:00+05:30
+Task:      Add 0.91" 128x32 I2C OLED display & Touch Switch to ESP32 Wearable
+=============================================================================
+
+CHANGES:
+--------
+1. Hardware Integration (firmware/esp32_sixthsense/esp32_sixthsense.ino):
+   - OLED 0.91" 128x32 I2C Display (SSD1306):
+     * SDA -> GPIO 21
+     * SCL -> GPIO 22
+     * Address -> 0x3C
+     * Fast I2C mode: 400kHz
+     * Display UI:
+       - Header line: "BLE: CONNECTED" / "BLE: SEARCHING..."
+       - Divider bar
+       - Main indicator (Size 2): "< LEFT", "^ FRONT", "RIGHT >", "v BACK", "[ALL 4]", "READY"
+   - Capacitive Touch Switch (Power ON/OFF Toggle):
+     * Signal (IO) -> GPIO 4 (configured with INPUT_PULLDOWN)
+     * Debounce time: 350ms
+     * Toggle Behavior:
+       - Touch to turn OFF: Disables all motors (DRV8833 SLEEP line pulled LOW),
+         ignores motor commands, shows "[ SYSTEM OFF ]" on OLED.
+       - Touch to turn ON: Wakes DRV8833 drivers (SLEEP line HIGH), gives a brief
+         120ms haptic confirmation buzz, restores live OLED status display.
+
+2. Flashed & Verified:
+   - Successfully compiled with Adafruit_SSD1306 and uploaded to ESP32 on /dev/ttyUSB0.
+   - Serial confirmed: "[oled] SSD1306 128x32 OLED initialized at 0x3C".
+=============================================================================
+```
+
+
+```
+=============================================================================
+Agent:     Antigravity (Gemini 3.8 Flash Low)
+Timestamp: 2026-11-03T02:22:00+05:30
+Task:      Set App Icon to Custom Spider Badge Image
+=============================================================================
+
+STATUS & COMPLETED WORK:
+-----------------------
+1. Verified Existing Artifacts:
+   - Found density raster assets generated in `mipmap-mdpi`, `mipmap-hdpi`,
+     `mipmap-xhdpi`, `mipmap-xxhdpi`, and `mipmap-xxxhdpi` (`ic_launcher.png`,
+     `ic_launcher_round.png`, `ic_launcher_foreground.png`).
+
+2. Missing Items Completed:
+   - Created `android/app/src/main/res/values/ic_launcher_background.xml`
+     defining matching background color `#D12A21`.
+   - Created Android 8.0+ adaptive icon definitions:
+     * `android/app/src/main/res/mipmap-anydpi-v26/ic_launcher.xml`
+     * `android/app/src/main/res/mipmap-anydpi-v26/ic_launcher_round.xml`
+   - Updated `android/app/src/main/AndroidManifest.xml` `<application>` tag:
+     * Added `android:icon="@mipmap/ic_launcher"`
+     * Added `android:roundIcon="@mipmap/ic_launcher_round"`
+
+3. Verification:
+   - Verified resource compilation with Gradle task `processDebugResources`.
+   - Ran `testDebugUnitTest` - all unit tests compiled and passed.
+=============================================================================
+```

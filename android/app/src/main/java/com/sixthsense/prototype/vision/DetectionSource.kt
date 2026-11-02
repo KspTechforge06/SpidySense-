@@ -85,10 +85,9 @@ class MlKitObjectAnalyzer(
                     DetectionResult(
                         // Unclassified objects are still potential obstacles.
                         label = label?.text ?: "Object",
-                        // Floor unclassified at 0.5 so they pass the default
-                        // confidence threshold (0.40). The user can raise the
-                        // threshold in Settings to filter them out if desired.
-                        confidence = label?.confidence ?: 0.5f,
+                        // Floor unclassified obstacles at 0.75 so they reliably pass the
+                        // navigation confidence threshold (default 0.40).
+                        confidence = label?.confidence ?: 0.75f,
                         normalizedHorizontalCenter = ((box.left + box.right) / 2f / normalizedWidth)
                             .coerceIn(0f, 1f),
                         boxAreaRatio = if (frameArea > 0f) {

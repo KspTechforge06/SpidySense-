@@ -12,7 +12,7 @@ import kotlinx.coroutines.flow.map
 private val Context.settingsDataStore by preferencesDataStore(name = "sixth_sense_settings")
 
 data class AppSettings(
-    val confidenceThreshold: Float = 0.60f,
+    val confidenceThreshold: Float = 0.40f,
     val cooldownMillis: Int = 700,
     val pulseDurationMillis: Int = 180,
     val showDebugLabels: Boolean = false,
@@ -21,7 +21,7 @@ data class AppSettings(
 class SettingsRepository(private val context: Context) {
     val settings: Flow<AppSettings> = context.settingsDataStore.data.map { values ->
         AppSettings(
-            values[CONFIDENCE] ?: 0.60f,
+            values[CONFIDENCE] ?: 0.40f,
             values[COOLDOWN] ?: 700,
             values[PULSE_DURATION] ?: 180,
             values[DEBUG_LABELS] ?: false,

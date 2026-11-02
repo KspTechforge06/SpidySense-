@@ -13,8 +13,8 @@ data class HapticPolicyConfig(
     val confidenceThreshold: Float = 0.40f,
     /** Per-zone cooldown — each zone can only fire once per this interval. */
     val perZoneCooldownMs: Long = 700,
-    /** A zone must be seen in this many consecutive frames before alerting. */
-    val requiredConsecutiveFrames: Int = 2,
+    /** A zone must be seen in this many consecutive frames before alerting (1 = responsive). */
+    val requiredConsecutiveFrames: Int = 1,
     /** If no detections arrive for this long, reset all zone states. */
     val staleResultTimeoutMs: Long = 1500,
 )
@@ -98,12 +98,12 @@ class HapticPolicy {
             }
         }
 
-        // 4. Update consecutive-frame counters.
+        // 4. Update consecutive-frame counters (decay by 1 on missed frame to tolerate jitter).
         for (zone in zonePriority) {
             if (zone in activeZones) {
                 consecutiveFrames[zone] = (consecutiveFrames[zone] ?: 0) + 1
             } else {
-                consecutiveFrames[zone] = 0
+                consecutiveFrames[zone] = maxOf(0, (consecutiveFrames[zone] ?: 0) - 1)
             }
         }
 

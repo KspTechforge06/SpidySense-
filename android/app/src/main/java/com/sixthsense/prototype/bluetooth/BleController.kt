@@ -39,6 +39,7 @@ class BleController(context: Context) {
     private var gatt: BluetoothGatt? = null
     private var commandCharacteristic: BluetoothGattCharacteristic? = null
     private var writeInFlight = false
+    private var lastWriteAtMs = 0L
     private var intentionalDisconnect = false
     private val scannedDevices = mutableMapOf<String, BluetoothDevice>()
 
@@ -168,12 +169,28 @@ class BleController(context: Context) {
         } else device.connectGatt(appContext, false, gattCallback)
     }
 
+    private fun refreshGatt(gatt: BluetoothGatt): Boolean {
+        return try {
+            val refreshMethod = gatt.javaClass.getMethod("refresh")
+            val refreshed = refreshMethod.invoke(gatt) as? Boolean ?: false
+            Log.d(TAG, "GATT cache refresh result: $refreshed")
+            refreshed
+        } catch (e: Exception) {
+            Log.w(TAG, "GATT refresh not supported: ${e.message}")
+            false
+        }
+    }
+
     private val gattCallback = object : BluetoothGattCallback() {
         @SuppressLint("MissingPermission")
         override fun onConnectionStateChange(gatt: BluetoothGatt, status: Int, newState: Int) {
             if (newState == BluetoothGatt.STATE_CONNECTED && status == BluetoothGatt.GATT_SUCCESS) {
                 _state.value = BleUiState(BleConnectionState.DISCOVERING_SERVICES, "Discovering wearable services…")
-                if (!gatt.discoverServices()) error("Could not begin BLE service discovery.")
+                // Flush stale GATT attribute handle cache before discovering services
+                refreshGatt(gatt)
+                handler.postDelayed({
+                    if (!gatt.discoverServices()) error("Could not begin BLE service discovery.")
+                }, 250)
             } else {
                 commandCharacteristic = null
                 writeInFlight = false
@@ -194,9 +211,12 @@ class BleController(context: Context) {
             val command = service?.getCharacteristic(UUID.fromString(BleProtocol.COMMAND_UUID))
             if (command == null) { error("Wearable service or command characteristic is missing."); return }
             commandCharacteristic = command
+
+            var descriptorPending = false
             service.getCharacteristic(UUID.fromString(BleProtocol.STATUS_UUID))?.let { statusCharacteristic ->
                 gatt.setCharacteristicNotification(statusCharacteristic, true)
                 statusCharacteristic.descriptors.firstOrNull { it.uuid == CCCD_UUID }?.let { descriptor ->
+                    descriptorPending = true
                     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
                         gatt.writeDescriptor(descriptor, BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE)
                     } else {
@@ -207,13 +227,26 @@ class BleController(context: Context) {
                     }
                 }
             }
+            if (!descriptorPending) {
+                _state.value = BleUiState(BleConnectionState.CONNECTED, "Wearable ready for commands.", commandReady = true)
+            } else {
+                _state.value = BleUiState(BleConnectionState.CONNECTING, "Subscribing to wearable status…")
+            }
+        }
+
+        override fun onDescriptorWrite(gatt: BluetoothGatt, descriptor: BluetoothGattDescriptor, status: Int) {
+            Log.d(TAG, "CCCD onDescriptorWrite status: $status")
             _state.value = BleUiState(BleConnectionState.CONNECTED, "Wearable ready for commands.", commandReady = true)
         }
 
         override fun onCharacteristicWrite(gatt: BluetoothGatt, characteristic: BluetoothGattCharacteristic, status: Int) {
             writeInFlight = false
-            if (status != BluetoothGatt.GATT_SUCCESS) error("Command write failed (GATT status $status).")
-            else _state.value = _state.value.copy(message = "Command sent.")
+            if (status != BluetoothGatt.GATT_SUCCESS) {
+                Log.w(TAG, "Command write status warning: $status")
+                _state.value = _state.value.copy(message = "Command write warning (status $status).")
+            } else {
+                _state.value = _state.value.copy(message = "Command sent.")
+            }
         }
 
         @Deprecated("Deprecated in Android 13")
@@ -259,11 +292,13 @@ class BleController(context: Context) {
         if (_state.value.connectionState != BleConnectionState.CONNECTED || currentGatt == null || characteristic == null) {
             error("Wearable is not ready for commands."); return
         }
-        if (writeInFlight) {
-            _state.value = _state.value.copy(message = "Previous command is still sending; new command dropped.")
+        val now = android.os.SystemClock.elapsedRealtime()
+        if (writeInFlight && now - lastWriteAtMs < 500) {
+            Log.d(TAG, "Previous command still in flight (${now - lastWriteAtMs}ms), dropping repeat")
             return
         }
         writeInFlight = true
+        lastWriteAtMs = now
         val bytes = BleProtocol.encode(command)
         val accepted = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             currentGatt.writeCharacteristic(characteristic, bytes, BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT) == BluetoothGatt.GATT_SUCCESS
@@ -271,9 +306,15 @@ class BleController(context: Context) {
             @Suppress("DEPRECATION")
             characteristic.value = bytes
             @Suppress("DEPRECATION")
+            characteristic.writeType = BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
+            @Suppress("DEPRECATION")
             currentGatt.writeCharacteristic(characteristic)
         }
-        if (!accepted) { writeInFlight = false; error("BLE did not accept the command write.") }
+        if (!accepted) {
+            writeInFlight = false
+            Log.w(TAG, "writeCharacteristic returned false/busy")
+            _state.value = _state.value.copy(message = "BLE pipe busy; retry command.")
+        }
     }
 
     @SuppressLint("MissingPermission")
