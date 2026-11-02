@@ -1,3 +1,5 @@
+import org.jetbrains.kotlin.gradle.dsl.JvmTarget
+
 plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
@@ -26,7 +28,10 @@ android {
     packaging { resources.excludes += "/META-INF/{AL2.0,LGPL2.1}" }
 }
 
-kotlin { jvmToolchain(17) }
+kotlin {
+    // Android Studio's bundled JDK (17+) may compile the project; emitted bytecode remains Java 17.
+    compilerOptions { jvmTarget.set(JvmTarget.JVM_17) }
+}
 
 dependencies {
     val composeBom = platform("androidx.compose:compose-bom:2024.12.01")
